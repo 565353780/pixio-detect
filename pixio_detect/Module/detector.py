@@ -1,16 +1,76 @@
 import os
+from typing import List, Optional, Tuple, Union
+
 import torch
+import torch.nn.functional as F
+from torchvision import transforms as T
+from torchvision.io import read_image
 
-from typing import List, Optional, Union
-
-from pixio_detect.Method.detect import (
-    createTransform,
-    preprocessImages,
-    postprocessPixioFeatures,
-    detectFile,
+from pixio_detect.Model import (
+    pixio_vit1b16,
+    pixio_vit5b16,
+    pixio_vitb16,
+    pixio_vith16,
+    pixio_vitl16,
 )
 
-import pixio as _pixio  # noqa: E402
+
+def _imagenet_normalize() -> T.Normalize:
+    return T.Normalize(
+        mean=(0.485, 0.456, 0.406),
+        std=(0.229, 0.224, 0.225),
+    )
+
+
+def _ceil_to_multiple(n: int, m: int) -> int:
+    return (n + m - 1) // m * m
+
+
+@torch.no_grad()
+def _pad_bchw_to_patch_multiple(
+    x: torch.Tensor,
+    patch_size: int = 16,
+    pad_value: float = 0.0,
+) -> torch.Tensor:
+    if x.dim() != 4:
+        raise ValueError(f"Expected BCHW tensor, got shape {tuple(x.shape)}")
+    _, _, h, w = x.shape
+    h2 = _ceil_to_multiple(h, patch_size)
+    w2 = _ceil_to_multiple(w, patch_size)
+    pad_h, pad_w = h2 - h, w2 - w
+    if pad_h == 0 and pad_w == 0:
+        return x
+    return F.pad(x, (0, pad_w, 0, pad_h), value=pad_value)
+
+
+@torch.no_grad()
+def _preprocess(
+    image_tensor: torch.Tensor,
+    norm: T.Normalize,
+    device: Union[str, torch.device],
+    dtype: torch.dtype,
+    patch_size: int,
+) -> Tuple[torch.Tensor, torch.dtype, torch.device]:
+    """[B,H,W,3] in [0,1] -> BCHW on device, padded to patch multiple, normalized."""
+    input_dtype = image_tensor.dtype
+    input_device = image_tensor.device
+    x = image_tensor.permute(0, 3, 1, 2).to(device, dtype=torch.float32)
+    x = _pad_bchw_to_patch_multiple(x, patch_size=patch_size, pad_value=0.0)
+    x = x.to(dtype=dtype)
+    x = norm(x)
+    return x, input_dtype, input_device
+
+
+@torch.no_grad()
+def _postprocess_features(
+    features: List[dict],
+    input_device: torch.device,
+    input_dtype: torch.dtype,
+) -> List[dict]:
+    return [
+        {k: v.to(input_device, dtype=input_dtype) for k, v in block.items()}
+        for block in features
+    ]
 
 
 class Detector(object):
@@ -43,11 +103,11 @@ class Detector(object):
             self.dtype = dtype
 
         model_configs = {
-            "vitb16": _pixio.pixio_vitb16,
-            "vitl16": _pixio.pixio_vitl16,
-            "vith16": _pixio.pixio_vith16,
-            "vit1b16": _pixio.pixio_vit1b16,
-            "vit5b16": _pixio.pixio_vit5b16,
+            "vitb16": pixio_vitb16,
+            "vitl16": pixio_vitl16,
+            "vith16": pixio_vith16,
+            "vit1b16": pixio_vit1b16,
+            "vit5b16": pixio_vit5b16,
         }
 
         if model_type not in model_configs:
@@ -56,34 +116,29 @@ class Detector(object):
                 f"Choose from: {list(model_configs.keys())}"
             )
 
-        factory = model_configs[model_type]
-        self.model = factory(pretrained=None)
-
+        self.model = model_configs[model_type]()
         self.model = self.model.to(self.device, dtype=self.dtype)
         self.model.eval()
         self.model.requires_grad_(False)
 
-        self.transform = createTransform()
+        self._norm = _imagenet_normalize()
 
         self.is_valid = False
         if model_file_path is not None:
             self.loadModel(model_file_path)
-        return
 
     def loadModel(self, model_file_path: str) -> bool:
         if not os.path.exists(model_file_path):
-            print("[ERROR][PixioDetector::loadModel]")
+            print("[ERROR][Detector::loadModel]")
             print("\t model file not exist!")
             print("\t model_file_path:", model_file_path)
             self.is_valid = False
             return False
 
-        model_state_dict = torch.load(
-            model_file_path, map_location="cpu", weights_only=False
-        )
-        self.model.load_state_dict(model_state_dict, strict=True)
+        state = torch.load(model_file_path, map_location="cpu", weights_only=False)
+        self.model.load_state_dict(state, strict=True)
 
-        print("[INFO][PixioDetector::loadModel]")
+        print("[INFO][Detector::loadModel]")
         print("\t model loaded from:", model_file_path)
         self.is_valid = True
         return True
@@ -94,22 +149,12 @@ class Detector(object):
         image_tensor: torch.Tensor,
         block_ids: Optional[List[int]] = None,
     ) -> List[dict]:
-        """
-        Args:
-            image_tensor: [B, H, W, 3], float32, range [0, 1]. No resize; H/W are
-                padded (bottom/right with zeros) to multiples of ``patch_size``.
-            block_ids: Optional block indices to return (same semantics as Pixio ``forward``).
-        Returns:
-            List of per-block dicts with keys such as ``patch_tokens_norm``,
-            ``cls_tokens_norm``, ``patch_tokens``, ``cls_tokens`` (see PixioViT.forward).
-            Tensors are cast back to the input image tensor's device/dtype.
-        """
-        image_tensor, input_dtype, input_device = preprocessImages(
+        x, input_dtype, input_device = _preprocess(
             image_tensor,
-            self.transform,
+            self._norm,
             self.device,
             self.dtype,
-            patch_size=self.patch_size,
+            self.patch_size,
         )
 
         device_type = self.device if isinstance(self.device, str) else self.device.type
@@ -120,12 +165,12 @@ class Detector(object):
         )
         if use_amp:
             with torch.autocast(device_type, dtype=self.dtype):
-                features = self.model.forward(image_tensor, block_ids=block_ids)
+                features = self.model.forward(x, block_ids=block_ids)
         else:
-            features = self.model.forward(image_tensor, block_ids=block_ids)
+            features = self.model.forward(x, block_ids=block_ids)
 
         assert isinstance(features, list)
-        return postprocessPixioFeatures(features, input_device, input_dtype)
+        return _postprocess_features(features, input_device, input_dtype)
 
     @torch.no_grad()
     def detectFile(
@@ -133,4 +178,24 @@ class Detector(object):
         image_file_path: str,
         block_ids: Optional[List[int]] = None,
     ) -> Union[List[dict], None]:
-        return detectFile(self, image_file_path, block_ids=block_ids)
+        if not os.path.exists(image_file_path):
+            print("[ERROR][Detector::detectFile]")
+            print("\t image file not exist!")
+            print("\t image_file_path:", image_file_path)
+            return None
+
+        try:
+            img = read_image(image_file_path)
+        except Exception:
+            print("[ERROR][Detector::detectFile]")
+            print("\t failed to read image!")
+            print("\t image_file_path:", image_file_path)
+            return None
+
+        if img.shape[0] != 3:
+            print("[ERROR][Detector::detectFile]")
+            print("\t expected 3-channel RGB image")
+            return None
+
+        t = (img.float() / 255.0).permute(1, 2, 0).unsqueeze(0)
+        return self.detect(t, block_ids=block_ids)
