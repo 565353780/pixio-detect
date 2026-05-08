@@ -149,6 +149,9 @@ class Detector(object):
         image_tensor: torch.Tensor,
         block_ids: Optional[List[int]] = None,
     ) -> List[dict]:
+        '''
+        float, [0 - 1], RGB order
+        '''
         x, input_dtype, input_device = _preprocess(
             image_tensor,
             self._norm,
