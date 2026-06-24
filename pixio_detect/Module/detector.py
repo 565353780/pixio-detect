@@ -81,9 +81,14 @@ class Detector(object):
         dtype="auto",
         device: str = "cpu",
         patch_size: int = 16,
+        is_offload_cpu: bool = False,
     ) -> None:
         self.device = device
         self.patch_size = patch_size
+        # offload 模式：模型加载并常驻 CPU，``detect()`` 推理窗口内才搬到
+        # ``self.device``；默认模式保持原始按 ``device`` 常驻的行为。
+        # 与 ``dino_detect.Module.detector.Detector`` 的同名开关语义一致。
+        self.is_offload_cpu = bool(is_offload_cpu)
         if dtype == "auto":
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                 self.dtype = torch.bfloat16
@@ -117,7 +122,9 @@ class Detector(object):
             )
 
         self.model = model_configs[model_type]()
-        self.model = self.model.to(self.device, dtype=self.dtype)
+        # offload 模式：模型常驻 CPU；默认模式：按 ``self.device`` 常驻。
+        load_device = "cpu" if self.is_offload_cpu else self.device
+        self.model = self.model.to(load_device, dtype=self.dtype)
         self.model.eval()
         self.model.requires_grad_(False)
 
@@ -143,6 +150,22 @@ class Detector(object):
         self.is_valid = True
         return True
 
+    def _moveModelToDevice(self) -> None:
+        '''offload 模式下推理前把模型从 CPU 搬到 ``self.device``。'''
+        if not self.is_offload_cpu:
+            return
+        if self.model is not None:
+            self.model = self.model.to(self.device, dtype=self.dtype)
+
+    def _offloadModelToCPU(self) -> None:
+        '''offload 模式下推理结束后把模型卸载回 CPU 并清显存。'''
+        if not self.is_offload_cpu:
+            return
+        if self.model is not None:
+            self.model = self.model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @torch.no_grad()
     def detect(
         self,
@@ -152,28 +175,32 @@ class Detector(object):
         '''
         float, [0 - 1], RGB order
         '''
-        x, input_dtype, input_device = _preprocess(
-            image_tensor,
-            self._norm,
-            self.device,
-            self.dtype,
-            self.patch_size,
-        )
+        self._moveModelToDevice()
+        try:
+            x, input_dtype, input_device = _preprocess(
+                image_tensor,
+                self._norm,
+                self.device,
+                self.dtype,
+                self.patch_size,
+            )
 
-        device_type = self.device if isinstance(self.device, str) else self.device.type
-        device_type = device_type.split(":")[0]
-        use_amp = device_type == "cuda" and self.dtype in (
-            torch.float16,
-            torch.bfloat16,
-        )
-        if use_amp:
-            with torch.autocast(device_type, dtype=self.dtype):
+            device_type = self.device if isinstance(self.device, str) else self.device.type
+            device_type = device_type.split(":")[0]
+            use_amp = device_type == "cuda" and self.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            )
+            if use_amp:
+                with torch.autocast(device_type, dtype=self.dtype):
+                    features = self.model.forward(x, block_ids=block_ids)
+            else:
                 features = self.model.forward(x, block_ids=block_ids)
-        else:
-            features = self.model.forward(x, block_ids=block_ids)
 
-        assert isinstance(features, list)
-        return _postprocess_features(features, input_device, input_dtype)
+            assert isinstance(features, list)
+            return _postprocess_features(features, input_device, input_dtype)
+        finally:
+            self._offloadModelToCPU()
 
     @torch.no_grad()
     def detectFile(
